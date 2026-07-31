@@ -94,7 +94,9 @@ async function main(): Promise<void> {
   }
 
   if (!fs.existsSync(junitPath)) {
-    throw new Error(`JUnit report not found at ${junitPath}`);
+    console.warn(`[xray:import] JUnit report missing at ${junitPath}`);
+    console.warn('[xray:import] Skipping Xray publish (no results file).');
+    process.exit(0);
   }
 
   const token = await authenticateXray();
