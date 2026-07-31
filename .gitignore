@@ -13,3 +13,7 @@ blob-report/
 *.log
 coverage/
 .vite/
+
+data/*.db-*
+*.db-shm
+*.db-wal
