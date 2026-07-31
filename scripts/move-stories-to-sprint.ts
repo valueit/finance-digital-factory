@@ -87,23 +87,26 @@ async function main(): Promise<void> {
         }),
       }
     );
-    // Start it
-    await jiraFetch(base, auth, `/rest/agile/1.0/sprint/${created.id}/state`, {
-      method: 'POST',
-      body: JSON.stringify({ state: 'active' }),
-    }).catch(async () => {
-      // Older API uses PUT on sprint
-      await jiraFetch(base, auth, `/rest/agile/1.0/sprint/${created.id}`, {
-        method: 'POST',
-        body: JSON.stringify({
-          id: created.id,
-          state: 'active',
-          name: created.name,
-        }),
-      }).catch(() => undefined);
-    });
-    sprint = { id: created.id, name: created.name, state: 'active' };
+    sprint = { id: created.id, name: created.name, state: 'future' };
     console.log(`[sprint] Created sprint ${sprint.id} — ${sprint.name}`);
+  }
+
+  // Ensure sprint is active (stories must land on the board, not backlog)
+  if (sprint.state !== 'active') {
+    const startDate = new Date().toISOString();
+    const endDate = new Date(Date.now() + 14 * 24 * 3600 * 1000).toISOString();
+    await jiraFetch(base, auth, `/rest/agile/1.0/sprint/${sprint.id}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        id: sprint.id,
+        state: 'active',
+        name: sprint.name,
+        startDate,
+        endDate,
+      }),
+    });
+    sprint = { ...sprint, state: 'active' };
+    console.log(`[sprint] Started sprint ${sprint.id} — ${sprint.name}`);
   }
 
   console.log(`[sprint] Target sprint ${sprint.id} — ${sprint.name} (${sprint.state})`);
