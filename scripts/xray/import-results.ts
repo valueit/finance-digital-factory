@@ -71,32 +71,44 @@ function injectXrayKeys(junitXml: string): string {
     `outcome=${process.env.DEMO_OUTCOME || 'n/a'}`,
   ].join(' | ');
 
-  return junitXml.replace(/<testcase\b([^>]*)>/g, (full, attrs: string) => {
-    const classMatch = attrs.match(/\bclassname="([^"]+)"/);
-    const nameMatch = attrs.match(/\bname="([^"]+)"/);
-    if (!classMatch) return full;
+  // Handle both <testcase ...>…</testcase> and self-closing <testcase .../>
+  return junitXml.replace(
+    /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g,
+    (full, attrs: string, closer: string, inner = '') => {
+      const classMatch = attrs.match(/\bclassname="([^"]+)"/);
+      const nameMatch = attrs.match(/\bname="([^"]+)"/);
+      if (!classMatch) return full;
 
-    const classname = classMatch[1];
-    const key =
-      resolveXrayTestKey(classname) ||
-      resolveXrayTestKey(`tests/${classname}`) ||
-      resolveXrayTestKey(classname.replace(/^.*\//, ''));
+      const classname = classMatch[1];
+      const key =
+        resolveXrayTestKey(classname) ||
+        resolveXrayTestKey(`tests/${classname}`) ||
+        resolveXrayTestKey(classname.replace(/^.*\//, ''));
 
-    if (!key) return full;
+      if (!key) return full;
 
-    let nextAttrs = attrs;
-    if (nameMatch && !nameMatch[1].includes(key)) {
-      nextAttrs = nextAttrs.replace(/\bname="[^"]*"/, `name="${nameMatch[1]} ${key}"`);
-    }
+      let nextAttrs = attrs.trim().replace(/\/\s*$/, '');
+      if (nameMatch && !nameMatch[1].includes(key)) {
+        nextAttrs = nextAttrs.replace(/\bname="[^"]*"/, `name="${nameMatch[1]} ${key}"`);
+      }
 
-    const systemOut = `${contextOut} | testKey=${key} | suite=${classname}`;
-    return `<testcase${nextAttrs}>
+      const systemOut = `${contextOut} | testKey=${key} | suite=${classname}`;
+      const safeOut = systemOut.replace(/[<>&]/g, '');
+      const body =
+        closer === '/>'
+          ? ''
+          : String(inner)
+              .replace(/<properties>[\s\S]*?<\/properties>/g, '')
+              .replace(/<system-out>[\s\S]*?<\/system-out>/g, '');
+
+      return `<testcase ${nextAttrs}>
 <properties>
   <property name="test_key" value="${key}"/>
-  <property name="requirements" value="${key}"/>
 </properties>
-<system-out>${systemOut.replace(/[<>&]/g, '')}</system-out>`;
-  });
+<system-out>${safeOut}</system-out>
+${body}</testcase>`;
+    }
+  );
 }
 
 async function importJunitMultipart(
@@ -114,34 +126,38 @@ async function importJunitMultipart(
     process.env.GITHUB_SHA?.slice(0, 12) ||
     `local-${new Date().toISOString().replace(/[:.]/g, '-')}`;
 
-  const params = new URLSearchParams({ projectKey });
-  if (executionKey) params.set('testExecKey', executionKey);
-  params.set('testPlanKey', testPlanKey);
-  params.set('testEnvironments', environment);
-
   const info = {
     fields: {
+      project: { key: projectKey },
       summary: buildExecutionSummary(),
       description: buildExecutionDescription(),
+      issuetype: { name: 'Test Execution' },
       fixVersions: [{ name: releaseName }],
       labels: ['DEMO-FINANCE-QA', 'playwright', 'ci-pipeline'],
     },
     xrayFields: {
       testPlanKey,
-      environments: [environment],
-      revision,
+      // Environments attached after import (auto-create via GraphQL if missing)
     },
   };
+
+  // Prefer real files on disk — Node FormData + File is more reliable than Blob alone
+  const tmpDir = path.join(ROOT, 'test-results');
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const infoPath = path.join(tmpDir, 'xray-info.json');
+  const resultsPath = path.join(tmpDir, 'junit-results.xray.xml');
+  fs.writeFileSync(infoPath, JSON.stringify(info, null, 2));
+  fs.writeFileSync(resultsPath, junitXml);
 
   const form = new FormData();
   form.append(
     'info',
-    new Blob([JSON.stringify(info, null, 2)], { type: 'application/json' }),
+    new Blob([fs.readFileSync(infoPath)], { type: 'application/json' }),
     'info.json'
   );
   form.append(
     'results',
-    new Blob([junitXml], { type: 'application/xml' }),
+    new Blob([fs.readFileSync(resultsPath)], { type: 'application/xml' }),
     'junit-results.xml'
   );
 
@@ -151,8 +167,9 @@ async function importJunitMultipart(
   console.log('[xray:import] revision:', revision);
   console.log('[xray:import] fixVersion:', releaseName);
 
+  // Dedicated multipart endpoint (not /junit)
   const res = await fetch(
-    `https://xray.cloud.getxray.app/api/v2/import/execution/junit?${params.toString()}`,
+    'https://xray.cloud.getxray.app/api/v2/import/execution/junit/multipart',
     {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
@@ -162,9 +179,14 @@ async function importJunitMultipart(
 
   const text = await res.text();
   if (!res.ok) {
-    // Fallback: plain XML body with query params only
+    // Fallback: plain XML + query params (metadata added afterwards via Jira/GraphQL)
     console.warn(`[xray:import] Multipart failed (${res.status}): ${text.slice(0, 400)}`);
     console.warn('[xray:import] Falling back to raw XML import with query params');
+    const params = new URLSearchParams({ projectKey });
+    if (executionKey) params.set('testExecKey', executionKey);
+    params.set('testPlanKey', testPlanKey);
+    // Do NOT pass testEnvironments here — unknown names fail the whole import.
+    // Environments are attached afterwards via GraphQL (auto-creates if needed).
     const fallback = await fetch(
       `https://xray.cloud.getxray.app/api/v2/import/execution/junit?${params.toString()}`,
       {
@@ -182,7 +204,8 @@ async function importJunitMultipart(
     }
     const body = JSON.parse(fallbackText) as {
       key?: string;
-      testExecIssue?: { key?: string };
+      id?: string;
+      testExecIssue?: { key?: string; id?: string };
     };
     const key = body.key || body.testExecIssue?.key;
     if (!key) throw new Error(`No TE key in fallback response: ${fallbackText}`);
@@ -191,7 +214,8 @@ async function importJunitMultipart(
 
   const body = JSON.parse(text) as {
     key?: string;
-    testExecIssue?: { key?: string };
+    id?: string;
+    testExecIssue?: { key?: string; id?: string };
   };
   const key = body.key || body.testExecIssue?.key;
   if (!key) throw new Error(`Xray import succeeded but no TE key returned: ${text}`);
@@ -242,10 +266,126 @@ async function enrichTestExecutionInJira(teKey: string): Promise<void> {
   console.log(`[xray:import] Enriched TE ${teKey} with summary/description/fixVersion/labels`);
 }
 
+async function xrayGraphql(
+  token: string,
+  query: string,
+  variables: Record<string, unknown>
+): Promise<{ data?: unknown; errors?: Array<{ message: string }> }> {
+  const res = await fetch('https://xray.cloud.getxray.app/api/v2/graphql', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  return (await res.json()) as { data?: unknown; errors?: Array<{ message: string }> };
+}
+
+async function enrichExecutionXrayFields(teIssueId: string): Promise<void> {
+  try {
+    const token = await authenticateXray();
+    const environment = process.env.TEST_ENVIRONMENT || 'PREPROD';
+    const revision =
+      process.env.GITHUB_SHA?.slice(0, 12) ||
+      `local-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+
+    // Environments: addTestEnvironmentsToTestExecution can create missing ones
+    const envPayload = await xrayGraphql(
+      token,
+      `mutation($issueId: String!, $testEnvironments: [String!]!) {
+        addTestEnvironmentsToTestExecution(
+          issueId: $issueId,
+          testEnvironments: $testEnvironments
+        ) {
+          associatedTestEnvironments
+          createdTestEnvironments
+          warning
+        }
+      }`,
+      { issueId: teIssueId, testEnvironments: [environment] }
+    );
+    if (envPayload.errors?.length) {
+      console.warn(
+        '[xray:import] environments warning:',
+        envPayload.errors.map((e) => e.message).join('; ')
+      );
+    } else {
+      console.log(`[xray:import] Environments:`, JSON.stringify(envPayload.data));
+    }
+
+    // Revision is not exposed via GraphQL Mutation on Cloud — keep it in description/summary
+    console.log(`[xray:import] Revision (documented in summary/description): ${revision}`);
+  } catch (err) {
+    console.warn('[xray:import] Could not set Xray TE fields:', err);
+  }
+}
+
+async function enrichTestRunOutputs(teIssueId: string): Promise<void> {
+  try {
+    const token = await authenticateXray();
+    const runsPayload = await xrayGraphql(
+      token,
+      `query($id: String!) {
+        getTestExecution(issueId: $id) {
+          testRuns(limit: 50) {
+            results {
+              id
+              test { jira(fields: ["key"]) }
+            }
+          }
+        }
+      }`,
+      { id: teIssueId }
+    );
+    const runs =
+      (
+        runsPayload.data as {
+          getTestExecution?: {
+            testRuns?: { results?: Array<{ id: string; test?: { jira?: { key?: string } } }> };
+          };
+        }
+      )?.getTestExecution?.testRuns?.results || [];
+
+    for (const run of runs) {
+      const testKey = run.test?.jira?.key || 'unknown';
+      const comment = [
+        `CI output for ${testKey}`,
+        `release=${process.env.RELEASE_NAME || 'R1.0'}`,
+        `environment=${process.env.TEST_ENVIRONMENT || 'PREPROD'}`,
+        `build=B${process.env.GITHUB_RUN_NUMBER || 'local'}`,
+        `commit=${(process.env.GITHUB_SHA || 'local').slice(0, 12)}`,
+        `outcome=${process.env.DEMO_OUTCOME || 'n/a'}`,
+        process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
+          ? `run=${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      const upd = await xrayGraphql(
+        token,
+        `mutation($id: String!, $comment: String) {
+          updateTestRun(id: $id, comment: $comment) {
+            warnings
+          }
+        }`,
+        { id: run.id, comment }
+      );
+      if (upd.errors?.length) {
+        console.warn(`[xray:import] test run comment ${testKey}:`, upd.errors.map((e) => e.message).join('; '));
+      } else {
+        console.log(`[xray:import] Output set on test run ${testKey}`);
+      }
+    }
+  } catch (err) {
+    console.warn('[xray:import] Could not set test run outputs:', err);
+  }
+}
+
 async function linkExecutionToTestPlan(teIssueId: string, testPlanKey: string): Promise<void> {
   try {
     const token = await authenticateXray();
-    // Resolve plan issue id
     const base = (process.env.JIRA_BASE_URL || '').replace(/\/$/, '');
     const email = process.env.JIRA_EMAIL;
     const jiraToken = process.env.JIRA_API_TOKEN;
@@ -258,23 +398,16 @@ async function linkExecutionToTestPlan(teIssueId: string, testPlanKey: string): 
     if (!planRes.ok) return;
     const plan = (await planRes.json()) as { id: string };
 
-    const res = await fetch('https://xray.cloud.getxray.app/api/v2/graphql', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        query: `mutation($issueId: String!, $testExecIssueIds: [String!]!) {
-          addTestExecutionsToTestPlan(issueId: $issueId, testExecIssueIds: $testExecIssueIds) {
-            addedTestExecutions
-            warning
-          }
-        }`,
-        variables: { issueId: plan.id, testExecIssueIds: [teIssueId] },
-      }),
-    });
-    const payload = (await res.json()) as { errors?: Array<{ message: string }> };
+    const payload = await xrayGraphql(
+      token,
+      `mutation($issueId: String!, $testExecIssueIds: [String!]!) {
+        addTestExecutionsToTestPlan(issueId: $issueId, testExecIssueIds: $testExecIssueIds) {
+          addedTestExecutions
+          warning
+        }
+      }`,
+      { issueId: plan.id, testExecIssueIds: [teIssueId] }
+    );
     if (payload.errors?.length) {
       console.warn('[xray:import] link to Test Plan warning:', payload.errors.map((e) => e.message).join('; '));
     } else {
@@ -333,11 +466,8 @@ async function main(): Promise<void> {
   await enrichTestExecutionInJira(result.key);
 
   const raw = result.raw as { id?: string; testExecIssue?: { id?: string } };
-  const teId = raw.id || raw.testExecIssue?.id;
-  if (teId) {
-    await linkExecutionToTestPlan(String(teId), testPlanKey);
-  } else {
-    // Resolve TE id from Jira then link
+  let teId = raw.id || raw.testExecIssue?.id;
+  if (!teId) {
     try {
       const base = (process.env.JIRA_BASE_URL || '').replace(/\/$/, '');
       const email = process.env.JIRA_EMAIL!;
@@ -347,12 +477,16 @@ async function main(): Promise<void> {
         headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
       });
       if (teRes.ok) {
-        const te = (await teRes.json()) as { id: string };
-        await linkExecutionToTestPlan(te.id, testPlanKey);
+        teId = (await teRes.json() as { id: string }).id;
       }
     } catch (err) {
       console.warn('[xray:import] TE id resolve failed:', err);
     }
+  }
+  if (teId) {
+    await enrichExecutionXrayFields(String(teId));
+    await enrichTestRunOutputs(String(teId));
+    await linkExecutionToTestPlan(String(teId), testPlanKey);
   }
 
   const jiraBase = process.env.JIRA_BASE_URL || 'https://valueit-labs.atlassian.net';
