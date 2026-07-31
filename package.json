@@ -24,7 +24,8 @@
     "qa:discover": "tsx scripts/discover-jira-xray.ts",
     "qa:dry-run": "tsx scripts/discover-jira-xray.ts",
     "qa:seed": "tsx scripts/prepare-live-demo.ts",
-    "qa:demo:prepare": "npm run qa:validate && npm run qa:seed"
+    "qa:demo:prepare": "npm run qa:validate && npm run qa:seed",
+    "qa:sprint": "tsx scripts/move-stories-to-sprint.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",

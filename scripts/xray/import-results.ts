@@ -7,101 +7,282 @@ import { DEFAULT_JUNIT } from './create-test-execution.js';
 import { resolveXrayTestKey, XRAY_TEST_MAPPING } from './mapping.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+const ROOT = path.resolve(__dirname, '../..');
+dotenv.config({ path: path.resolve(ROOT, '.env') });
+
+function loadTestPlanKey(): string {
+  if (process.env.XRAY_TEST_PLAN_KEY?.trim()) {
+    return process.env.XRAY_TEST_PLAN_KEY.trim();
+  }
+  try {
+    const mapping = JSON.parse(
+      fs.readFileSync(path.join(ROOT, 'generated/demo-object-mapping.json'), 'utf8')
+    ) as Record<string, { key?: string }>;
+    return mapping['FDF-PLAN-R10']?.key || 'FDF-31';
+  } catch {
+    return 'FDF-31';
+  }
+}
 
 function findJunitFile(): string {
   const configured = process.env.JUNIT_RESULTS_PATH;
-  if (configured && fs.existsSync(configured)) {
-    return configured;
-  }
-  if (fs.existsSync(DEFAULT_JUNIT)) {
-    return DEFAULT_JUNIT;
-  }
+  if (configured && fs.existsSync(configured)) return configured;
+  if (fs.existsSync(DEFAULT_JUNIT)) return DEFAULT_JUNIT;
   throw new Error(`JUnit report not found at ${DEFAULT_JUNIT}`);
 }
 
-/**
- * Inject Xray Test issue keys into JUnit XML so Cloud import can link results.
- * Playwright classname looks like: api/reject-request-without-amount.spec.ts
- */
-function injectXrayKeys(junitXml: string): string {
-  return junitXml.replace(
-    /<testcase\b([^>]*)>/g,
-    (full, attrs: string) => {
-      const classMatch = attrs.match(/\bclassname="([^"]+)"/);
-      const nameMatch = attrs.match(/\bname="([^"]+)"/);
-      if (!classMatch) return full;
-
-      const classname = classMatch[1];
-      const key =
-        resolveXrayTestKey(classname) ||
-        resolveXrayTestKey(`tests/${classname}`) ||
-        resolveXrayTestKey(classname.replace(/^.*\//, ''));
-
-      if (!key) return full;
-
-      // Ensure key appears in the test name (Xray Cloud matcher)
-      let nextAttrs = attrs;
-      if (nameMatch && !nameMatch[1].includes(key)) {
-        const newName = `${nameMatch[1]} ${key}`;
-        nextAttrs = nextAttrs.replace(/\bname="[^"]*"/, `name="${newName}"`);
-      }
-
-      return `<testcase${nextAttrs}>\n<properties><property name="test_key" value="${key}"/></properties>`;
-    }
-  );
+function buildExecutionSummary(): string {
+  const run = process.env.GITHUB_RUN_NUMBER || 'local';
+  const outcome = process.env.DEMO_OUTCOME || 'success';
+  const envName = process.env.TEST_ENVIRONMENT || 'PREPROD';
+  const release = process.env.RELEASE_NAME || 'R1.0';
+  return `AUTO — TNR complète — ${release} RC2 — B${run} — ${envName} — ${outcome}`;
 }
 
-async function importJunit(
+function buildExecutionDescription(): string {
+  const lines = [
+    'Automated Playwright execution published by CI/CD.',
+    '',
+    `Release: ${process.env.RELEASE_NAME || 'R1.0'}`,
+    `Environment: ${process.env.TEST_ENVIRONMENT || 'PREPROD'}`,
+    `Outcome requested: ${process.env.DEMO_OUTCOME || 'n/a'}`,
+    `GitHub run: #${process.env.GITHUB_RUN_NUMBER || 'local'}`,
+    `Workflow: ${process.env.GITHUB_WORKFLOW || 'n/a'}`,
+    `Commit: ${process.env.GITHUB_SHA || 'n/a'}`,
+    `Branch: ${process.env.GITHUB_REF_NAME || 'n/a'}`,
+    `Actor: ${process.env.GITHUB_ACTOR || 'n/a'}`,
+    `Repository: ${process.env.GITHUB_REPOSITORY || 'n/a'}`,
+    process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
+      ? `Run URL: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+      : '',
+    '',
+    'Mapped Playwright tests:',
+    ...Object.entries(XRAY_TEST_MAPPING).map(([file, key]) => `- ${key} ← ${file}`),
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
+function injectXrayKeys(junitXml: string): string {
+  const contextOut = [
+    `release=${process.env.RELEASE_NAME || 'R1.0'}`,
+    `environment=${process.env.TEST_ENVIRONMENT || 'PREPROD'}`,
+    `build=B${process.env.GITHUB_RUN_NUMBER || 'local'}`,
+    `commit=${(process.env.GITHUB_SHA || 'local').slice(0, 8)}`,
+    `outcome=${process.env.DEMO_OUTCOME || 'n/a'}`,
+  ].join(' | ');
+
+  return junitXml.replace(/<testcase\b([^>]*)>/g, (full, attrs: string) => {
+    const classMatch = attrs.match(/\bclassname="([^"]+)"/);
+    const nameMatch = attrs.match(/\bname="([^"]+)"/);
+    if (!classMatch) return full;
+
+    const classname = classMatch[1];
+    const key =
+      resolveXrayTestKey(classname) ||
+      resolveXrayTestKey(`tests/${classname}`) ||
+      resolveXrayTestKey(classname.replace(/^.*\//, ''));
+
+    if (!key) return full;
+
+    let nextAttrs = attrs;
+    if (nameMatch && !nameMatch[1].includes(key)) {
+      nextAttrs = nextAttrs.replace(/\bname="[^"]*"/, `name="${nameMatch[1]} ${key}"`);
+    }
+
+    const systemOut = `${contextOut} | testKey=${key} | suite=${classname}`;
+    return `<testcase${nextAttrs}>
+<properties>
+  <property name="test_key" value="${key}"/>
+  <property name="requirements" value="${key}"/>
+</properties>
+<system-out>${systemOut.replace(/[<>&]/g, '')}</system-out>`;
+  });
+}
+
+async function importJunitMultipart(
   token: string,
   junitXml: string,
   executionKey?: string
 ): Promise<{ key: string; raw: unknown }> {
   const projectKey = process.env.JIRA_PROJECT_KEY;
-  if (!projectKey) {
-    throw new Error('JIRA_PROJECT_KEY is required');
-  }
+  if (!projectKey) throw new Error('JIRA_PROJECT_KEY is required');
+
+  const testPlanKey = loadTestPlanKey();
+  const environment = process.env.TEST_ENVIRONMENT || 'PREPROD';
+  const releaseName = process.env.RELEASE_NAME || 'R1.0';
+  const revision =
+    process.env.GITHUB_SHA?.slice(0, 12) ||
+    `local-${new Date().toISOString().replace(/[:.]/g, '-')}`;
 
   const params = new URLSearchParams({ projectKey });
-  if (executionKey) {
-    params.set('testExecKey', executionKey);
-  }
+  if (executionKey) params.set('testExecKey', executionKey);
+  params.set('testPlanKey', testPlanKey);
+  params.set('testEnvironments', environment);
 
-  // Optional: set a clear TE summary via query is not supported on junit endpoint;
-  // Xray creates a TE automatically when testExecKey is omitted.
+  const info = {
+    fields: {
+      summary: buildExecutionSummary(),
+      description: buildExecutionDescription(),
+      fixVersions: [{ name: releaseName }],
+      labels: ['DEMO-FINANCE-QA', 'playwright', 'ci-pipeline'],
+    },
+    xrayFields: {
+      testPlanKey,
+      environments: [environment],
+      revision,
+    },
+  };
+
+  const form = new FormData();
+  form.append(
+    'info',
+    new Blob([JSON.stringify(info, null, 2)], { type: 'application/json' }),
+    'info.json'
+  );
+  form.append(
+    'results',
+    new Blob([junitXml], { type: 'application/xml' }),
+    'junit-results.xml'
+  );
+
+  console.log('[xray:import] Multipart info summary:', info.fields.summary);
+  console.log('[xray:import] testPlanKey:', testPlanKey);
+  console.log('[xray:import] environment:', environment);
+  console.log('[xray:import] revision:', revision);
+  console.log('[xray:import] fixVersion:', releaseName);
+
   const res = await fetch(
     `https://xray.cloud.getxray.app/api/v2/import/execution/junit?${params.toString()}`,
     {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/xml',
-        Authorization: `Bearer ${token}`,
-      },
-      body: junitXml,
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
     }
   );
 
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`JUnit import failed (${res.status}): ${text}`);
+    // Fallback: plain XML body with query params only
+    console.warn(`[xray:import] Multipart failed (${res.status}): ${text.slice(0, 400)}`);
+    console.warn('[xray:import] Falling back to raw XML import with query params');
+    const fallback = await fetch(
+      `https://xray.cloud.getxray.app/api/v2/import/execution/junit?${params.toString()}`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/xml',
+        },
+        body: junitXml,
+      }
+    );
+    const fallbackText = await fallback.text();
+    if (!fallback.ok) {
+      throw new Error(`JUnit import failed (${fallback.status}): ${fallbackText}`);
+    }
+    const body = JSON.parse(fallbackText) as {
+      key?: string;
+      testExecIssue?: { key?: string };
+    };
+    const key = body.key || body.testExecIssue?.key;
+    if (!key) throw new Error(`No TE key in fallback response: ${fallbackText}`);
+    return { key, raw: body };
   }
 
-  let body: {
+  const body = JSON.parse(text) as {
     key?: string;
-    id?: string;
-    testExecIssue?: { key?: string; id?: string };
-  } = {};
-  try {
-    body = JSON.parse(text) as typeof body;
-  } catch {
-    throw new Error(`Unexpected non-JSON Xray response: ${text.slice(0, 500)}`);
+    testExecIssue?: { key?: string };
+  };
+  const key = body.key || body.testExecIssue?.key;
+  if (!key) throw new Error(`Xray import succeeded but no TE key returned: ${text}`);
+  return { key, raw: body };
+}
+
+async function enrichTestExecutionInJira(teKey: string): Promise<void> {
+  const base = (process.env.JIRA_BASE_URL || '').replace(/\/$/, '');
+  const email = process.env.JIRA_EMAIL;
+  const token = process.env.JIRA_API_TOKEN;
+  if (!base || !email || !token) {
+    console.warn('[xray:import] Jira creds missing — skip TE field enrichment');
+    return;
   }
 
-  const key = body.key || body.testExecIssue?.key;
-  if (!key) {
-    throw new Error(`Xray import succeeded but no Test Execution key returned: ${text}`);
+  const auth = Buffer.from(`${email}:${token}`).toString('base64');
+  const descriptionText = buildExecutionDescription();
+  const adf = {
+    type: 'doc',
+    version: 1,
+    content: descriptionText.split('\n').map((line) => ({
+      type: 'paragraph',
+      content: line ? [{ type: 'text', text: line }] : [],
+    })),
+  };
+
+  const res = await fetch(`${base}/rest/api/3/issue/${encodeURIComponent(teKey)}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Basic ${auth}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      fields: {
+        summary: buildExecutionSummary(),
+        description: adf,
+        fixVersions: [{ name: process.env.RELEASE_NAME || 'R1.0' }],
+        labels: ['DEMO-FINANCE-QA', 'playwright', 'ci-pipeline'],
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    console.warn(`[xray:import] TE Jira update failed (${res.status}): ${(await res.text()).slice(0, 300)}`);
+    return;
   }
-  return { key, raw: body };
+  console.log(`[xray:import] Enriched TE ${teKey} with summary/description/fixVersion/labels`);
+}
+
+async function linkExecutionToTestPlan(teIssueId: string, testPlanKey: string): Promise<void> {
+  try {
+    const token = await authenticateXray();
+    // Resolve plan issue id
+    const base = (process.env.JIRA_BASE_URL || '').replace(/\/$/, '');
+    const email = process.env.JIRA_EMAIL;
+    const jiraToken = process.env.JIRA_API_TOKEN;
+    if (!base || !email || !jiraToken) return;
+
+    const auth = Buffer.from(`${email}:${jiraToken}`).toString('base64');
+    const planRes = await fetch(`${base}/rest/api/3/issue/${encodeURIComponent(testPlanKey)}?fields=id`, {
+      headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+    });
+    if (!planRes.ok) return;
+    const plan = (await planRes.json()) as { id: string };
+
+    const res = await fetch('https://xray.cloud.getxray.app/api/v2/graphql', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query: `mutation($issueId: String!, $testExecIssueIds: [String!]!) {
+          addTestExecutionsToTestPlan(issueId: $issueId, testExecIssueIds: $testExecIssueIds) {
+            addedTestExecutions
+            warning
+          }
+        }`,
+        variables: { issueId: plan.id, testExecIssueIds: [teIssueId] },
+      }),
+    });
+    const payload = (await res.json()) as { errors?: Array<{ message: string }> };
+    if (payload.errors?.length) {
+      console.warn('[xray:import] link to Test Plan warning:', payload.errors.map((e) => e.message).join('; '));
+    } else {
+      console.log(`[xray:import] Linked TE to Test Plan ${testPlanKey}`);
+    }
+  } catch (err) {
+    console.warn('[xray:import] Could not link TE to Test Plan:', err);
+  }
 }
 
 async function main(): Promise<void> {
@@ -115,49 +296,68 @@ async function main(): Promise<void> {
   const dryRunRaw = (process.env.DRY_RUN ?? '').trim().toLowerCase();
   const dryRun = dryRunRaw === 'true' || dryRunRaw === '1' || dryRunRaw === 'yes';
   const existingExecution = (process.env.XRAY_TEST_EXECUTION_KEY || '').trim();
+  const testPlanKey = loadTestPlanKey();
 
   console.log('[xray:import] Parameters');
-  console.log(`  DRY_RUN active: ${dryRun} (raw=${JSON.stringify(process.env.DRY_RUN ?? null)})`);
+  console.log(`  DRY_RUN active: ${dryRun}`);
   console.log(`  JIRA_PROJECT_KEY set: ${Boolean(process.env.JIRA_PROJECT_KEY)}`);
-  console.log(`  XRAY_TEST_EXECUTION_KEY=${existingExecution || '(empty → Xray will create a new TE)'}`);
-  console.log(`  XRAY_CLIENT_ID set: ${Boolean(process.env.XRAY_CLIENT_ID)}`);
-  console.log(`  XRAY_CLIENT_SECRET set: ${Boolean(process.env.XRAY_CLIENT_SECRET)}`);
+  console.log(`  XRAY_TEST_EXECUTION_KEY=${existingExecution || '(empty → create new TE)'}`);
+  console.log(`  XRAY_TEST_PLAN_KEY=${testPlanKey}`);
+  console.log(`  RELEASE_NAME=${process.env.RELEASE_NAME || 'R1.0'}`);
+  console.log(`  TEST_ENVIRONMENT=${process.env.TEST_ENVIRONMENT || 'PREPROD'}`);
+  console.log(`  GITHUB_RUN_NUMBER=${process.env.GITHUB_RUN_NUMBER || '(local)'}`);
   console.log(`  JUnit file: ${junitPath} (exists=${fs.existsSync(junitPath)})`);
+  console.log('  Planned summary:', buildExecutionSummary());
   console.log('  Test mapping:', XRAY_TEST_MAPPING);
 
   if (dryRun) {
-    console.log('[xray:import] DRY_RUN=true → no remote Xray write. Exiting successfully.');
+    console.log('[xray:import] DRY_RUN=true → no remote Xray write.');
     return;
   }
 
   if (!fs.existsSync(junitPath)) {
-    console.warn(`[xray:import] JUnit report missing at ${junitPath}`);
-    console.warn('[xray:import] Skipping Xray publish (no results file).');
+    console.warn(`[xray:import] JUnit missing at ${junitPath} — skip publish`);
     process.exit(0);
   }
 
-  const original = fs.readFileSync(junitPath, 'utf8');
-  const enriched = injectXrayKeys(original);
+  const enriched = injectXrayKeys(fs.readFileSync(junitPath, 'utf8'));
   const enrichedPath = path.join(path.dirname(junitPath), 'junit-results.xray.xml');
   fs.writeFileSync(enrichedPath, enriched);
-  console.log(`[xray:import] Wrote enriched JUnit: ${enrichedPath}`);
 
   const token = await authenticateXray();
-  console.log('[xray:import] Authenticated to Xray Cloud');
-
-  // Do NOT pre-create an empty Test Execution (often fails / useless).
-  // Importing JUnit without testExecKey creates a new TE automatically.
-  const result = await importJunit(
-    token,
-    enriched,
-    existingExecution || undefined
-  );
+  const result = await importJunitMultipart(token, enriched, existingExecution || undefined);
 
   console.log('[xray:import] Import completed');
   console.log(`[xray:import] Test Execution key: ${result.key}`);
-  console.log(
-    `[xray:import] URL: ${process.env.JIRA_BASE_URL || 'https://valueit-labs.atlassian.net'}/browse/${result.key}`
-  );
+
+  await enrichTestExecutionInJira(result.key);
+
+  const raw = result.raw as { id?: string; testExecIssue?: { id?: string } };
+  const teId = raw.id || raw.testExecIssue?.id;
+  if (teId) {
+    await linkExecutionToTestPlan(String(teId), testPlanKey);
+  } else {
+    // Resolve TE id from Jira then link
+    try {
+      const base = (process.env.JIRA_BASE_URL || '').replace(/\/$/, '');
+      const email = process.env.JIRA_EMAIL!;
+      const jiraToken = process.env.JIRA_API_TOKEN!;
+      const auth = Buffer.from(`${email}:${jiraToken}`).toString('base64');
+      const teRes = await fetch(`${base}/rest/api/3/issue/${result.key}?fields=id`, {
+        headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+      });
+      if (teRes.ok) {
+        const te = (await teRes.json()) as { id: string };
+        await linkExecutionToTestPlan(te.id, testPlanKey);
+      }
+    } catch (err) {
+      console.warn('[xray:import] TE id resolve failed:', err);
+    }
+  }
+
+  const jiraBase = process.env.JIRA_BASE_URL || 'https://valueit-labs.atlassian.net';
+  console.log(`[xray:import] URL: ${jiraBase}/browse/${result.key}`);
+  console.log(`[xray:import] Test Plan: ${jiraBase}/browse/${testPlanKey}`);
 }
 
 main().catch((err) => {
