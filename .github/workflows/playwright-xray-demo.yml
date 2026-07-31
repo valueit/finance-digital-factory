@@ -60,24 +60,35 @@ jobs:
       - name: Initialize SQLite
         run: npm run db:init
 
-      - name: Start backend
-        run: npm run start -w backend &
+      - name: Build backend and frontend
+        run: npm run build
 
-      - name: Build and start frontend
+      - name: Start backend
         run: |
-          npm run build -w frontend
-          npm run preview -w frontend &
+          npm run start -w backend > /tmp/backend.log 2>&1 &
+          echo "Backend PID $!"
+
+      - name: Start frontend
+        run: |
+          npm run preview -w frontend > /tmp/frontend.log 2>&1 &
+          echo "Frontend PID $!"
 
       - name: Wait for health endpoint
         run: |
           for i in $(seq 1 60); do
             if curl -sf http://localhost:3000/api/health; then
+              echo
               echo "Backend is up"
               exit 0
             fi
+            echo "Attempt $i/60 — waiting for backend..."
             sleep 2
           done
           echo "Backend failed to become healthy"
+          echo "===== backend.log ====="
+          cat /tmp/backend.log || true
+          echo "===== frontend.log ====="
+          cat /tmp/frontend.log || true
           exit 1
 
       - name: Reset demo data
