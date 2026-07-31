@@ -34,6 +34,7 @@ jobs:
       DRY_RUN: ${{ secrets.XRAY_DRY_RUN }}
       CI: true
       PORT: 3000
+      JIRA_BASE_URL: https://valueit-labs.atlassian.net
 
     steps:
       - name: Checkout
@@ -49,7 +50,15 @@ jobs:
         run: |
           echo "DEMO_RESET_TOKEN=${DEMO_RESET_TOKEN:-demo-reset-token}" >> "$GITHUB_ENV"
           echo "JWT_SECRET=${JWT_SECRET:-ci-jwt-secret}" >> "$GITHUB_ENV"
-          echo "DRY_RUN=${DRY_RUN:-true}" >> "$GITHUB_ENV"
+          # Treat only explicit true/1/yes as dry-run; default false for CI publish
+          if [ "${DRY_RUN}" = "true" ] || [ "${DRY_RUN}" = "1" ] || [ "${DRY_RUN}" = "yes" ]; then
+            echo "DRY_RUN=true" >> "$GITHUB_ENV"
+            echo "XRAY_DRY_RUN_ACTIVE=true" >> "$GITHUB_ENV"
+          else
+            echo "DRY_RUN=false" >> "$GITHUB_ENV"
+            echo "XRAY_DRY_RUN_ACTIVE=false" >> "$GITHUB_ENV"
+          fi
+          echo "JIRA_BASE_URL=${JIRA_BASE_URL:-https://valueit-labs.atlassian.net}" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: npm ci

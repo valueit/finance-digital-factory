@@ -11,7 +11,7 @@ test.describe('Reject request without amount', () => {
     await resetDemoData(request);
   });
 
-  test('API rejects financing request without amount @FDF-TEST-API', async ({
+  test('API rejects financing request without amount @FDF-30', async ({
     request,
   }) => {
     const token = await loginAsAgent(request);

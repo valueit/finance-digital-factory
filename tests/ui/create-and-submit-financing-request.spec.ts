@@ -5,7 +5,7 @@ test.describe('Create and submit financing request', () => {
     await resetDemoData(request);
   });
 
-  test('agent can create and submit a financing request @FDF-TEST-UI', async ({
+  test('agent can create and submit a financing request @FDF-29', async ({
     page,
   }) => {
     if (process.env.DEMO_OUTCOME === 'failure') {
