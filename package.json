@@ -13,13 +13,18 @@
     "start": "concurrently -n backend,frontend -c blue,green \"npm run start -w backend\" \"npm run preview -w frontend\"",
     "db:init": "npm run db:init -w backend",
     "demo:reset": "npm run demo:reset -w backend",
-    "test": "playwright test",
-    "test:ui": "playwright test tests/ui",
-    "test:api": "playwright test tests/api",
+    "test": "playwright test --config=playwright.config.cjs",
+    "test:ui": "playwright test --config=playwright.config.cjs tests/ui",
+    "test:api": "playwright test --config=playwright.config.cjs tests/api",
     "test:report": "playwright show-report",
     "xray:auth": "tsx scripts/xray/authenticate.ts",
     "xray:import": "tsx scripts/xray/import-results.ts",
-    "xray:create-execution": "tsx scripts/xray/create-test-execution.ts"
+    "xray:create-execution": "tsx scripts/xray/create-test-execution.ts",
+    "qa:validate": "tsx scripts/validate-config.ts",
+    "qa:discover": "tsx scripts/discover-jira-xray.ts",
+    "qa:dry-run": "tsx scripts/discover-jira-xray.ts",
+    "qa:seed": "tsx scripts/prepare-live-demo.ts",
+    "qa:demo:prepare": "npm run qa:validate && npm run qa:seed"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",
