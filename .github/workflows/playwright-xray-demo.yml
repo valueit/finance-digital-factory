@@ -1,0 +1,115 @@
+name: Playwright Xray Demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      outcome:
+        description: Demo outcome
+        required: true
+        default: success
+        type: choice
+        options:
+          - success
+          - failure
+
+jobs:
+  playwright-xray:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      APP_BASE_URL: http://localhost:5173
+      API_BASE_URL: http://localhost:3000
+      TEST_AGENT_USERNAME: agent
+      TEST_AGENT_PASSWORD: agent123
+      DEMO_RESET_TOKEN: ${{ secrets.DEMO_RESET_TOKEN }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      DEMO_OUTCOME: ${{ github.event.inputs.outcome }}
+      XRAY_CLIENT_ID: ${{ secrets.XRAY_CLIENT_ID }}
+      XRAY_CLIENT_SECRET: ${{ secrets.XRAY_CLIENT_SECRET }}
+      JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+      XRAY_TEST_EXECUTION_KEY: ${{ secrets.XRAY_TEST_EXECUTION_KEY }}
+      XRAY_TEST_KEY_UI: ${{ secrets.XRAY_TEST_KEY_UI }}
+      XRAY_TEST_KEY_API: ${{ secrets.XRAY_TEST_KEY_API }}
+      DRY_RUN: ${{ secrets.XRAY_DRY_RUN }}
+      CI: true
+      PORT: 3000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Apply local defaults for missing secrets
+        run: |
+          echo "DEMO_RESET_TOKEN=${DEMO_RESET_TOKEN:-demo-reset-token}" >> "$GITHUB_ENV"
+          echo "JWT_SECRET=${JWT_SECRET:-ci-jwt-secret}" >> "$GITHUB_ENV"
+          echo "DRY_RUN=${DRY_RUN:-true}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Initialize SQLite
+        run: npm run db:init
+
+      - name: Start backend
+        run: npm run start -w backend &
+
+      - name: Build and start frontend
+        run: |
+          npm run build -w frontend
+          npm run preview -w frontend &
+
+      - name: Wait for health endpoint
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:3000/api/health; then
+              echo "Backend is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Backend failed to become healthy"
+          exit 1
+
+      - name: Reset demo data
+        run: |
+          curl -sf -X POST http://localhost:3000/api/demo/reset \
+            -H "x-demo-reset-token: ${DEMO_RESET_TOKEN}"
+
+      - name: Run Playwright tests
+        id: tests
+        continue-on-error: true
+        run: npm run test
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-html-report
+          path: playwright-report
+          if-no-files-found: ignore
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-junit-report
+          path: test-results/junit-results.xml
+          if-no-files-found: ignore
+
+      - name: Publish results to Xray
+        if: always()
+        run: npm run xray:import
+
+      - name: Fail job if tests failed
+        if: steps.tests.outcome != 'success'
+        run: exit 1
