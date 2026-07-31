@@ -1,11 +1,8 @@
-import { defineConfig, devices } from '@playwright/test';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+const { defineConfig, devices } = require('@playwright/test');
+const fs = require('node:fs');
+const path = require('node:path');
 
-const rootDir = path.dirname(fileURLToPath(import.meta.url));
-
-function loadEnvFile(filePath: string): void {
+function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
   const content = fs.readFileSync(filePath, 'utf8');
   for (const rawLine of content.split(/\r?\n/)) {
@@ -27,12 +24,12 @@ function loadEnvFile(filePath: string): void {
   }
 }
 
-loadEnvFile(path.join(rootDir, '.env'));
+loadEnvFile(path.join(__dirname, '.env'));
 
 const baseURL = process.env.APP_BASE_URL || 'http://localhost:5173';
 const isCI = !!process.env.CI;
 
-export default defineConfig({
+module.exports = defineConfig({
   testDir: './tests',
   fullyParallel: false,
   forbidOnly: isCI,
